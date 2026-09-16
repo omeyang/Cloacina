@@ -12,7 +12,7 @@ pub enum EngineChoice {
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Linux 清理工具：cleanup -a 全部清理，cleanup -an 预览全部",
+    about = "Linux 清理工具：cloacina -a 全部清理，cloacina -an 预览全部",
     after_help = "容器和镜像分别选择：全部删除 / 逐个确认 / 跳过。\n默认保留 ~/.cache/gitstatus、Zsh 历史、Claude memory、容器卷和网络。\n文件清理会删除旧 shell 配置和 .venvs；首次在其他机器运行请先用 -n 查看。"
 )]
 pub struct Options {
@@ -57,17 +57,17 @@ mod tests {
 
     #[test]
     fn short_all_preview_and_legacy_flags() {
-        let opts = Options::try_parse_from(["cleanup", "-an"]).unwrap();
+        let opts = Options::try_parse_from(["cloacina", "-an"]).unwrap();
         assert!(opts.all && opts.dry_run);
-        let opts = Options::try_parse_from(["cleanup", "--deep", "--system"]).unwrap();
+        let opts = Options::try_parse_from(["cloacina", "--deep", "--system"]).unwrap();
         assert!(opts.deep && opts.system);
     }
 
     #[test]
     fn only_conflicts_with_other_scopes() {
         for flag in ["--all", "--deep", "--system", "--skip-containers"] {
-            assert!(Options::try_parse_from(["cleanup", "--containers-only", flag]).is_err());
+            assert!(Options::try_parse_from(["cloacina", "--containers-only", flag]).is_err());
         }
-        assert!(Options::try_parse_from(["cleanup", "-d", "-1"]).is_err());
+        assert!(Options::try_parse_from(["cloacina", "-d", "-1"]).is_err());
     }
 }

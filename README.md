@@ -1,25 +1,53 @@
-# cleanup
+# Cloacina
 
-用 Rust 编写的 Linux 清理工具。`cleanup -a` 一次启用全部清理，容器和镜像分别交互选择 **全部删除 / 逐个确认 / 跳过**。
+[![CI](https://github.com/omeyang/cloacina/actions/workflows/ci.yml/badge.svg)](https://github.com/omeyang/cloacina/actions/workflows/ci.yml)
+[![Release](https://github.com/omeyang/cloacina/actions/workflows/release.yml/badge.svg)](https://github.com/omeyang/cloacina/actions/workflows/release.yml)
+[![Latest release](https://img.shields.io/github/v/release/omeyang/cloacina)](https://github.com/omeyang/cloacina/releases/latest)
+
+名字来自古罗马女神 **Cloacina**：她与排水、净化相关，守护罗马的 Cloaca Maxima。借用这一典故，为 Linux 清走积存的文件、缓存和容器资源。[典故来源：Platner & Ashby《古罗马地形辞典》](https://penelope.uchicago.edu/Thayer/E/Gazetteer/Places/Europe/Italy/Lazio/Roma/Rome/_Texts/PLATOP%2A/Sacrum_Cloacinae.html)
+
+用 Rust 编写的 Linux 清理工具。`cloacina -a` 一次启用全部清理，容器和镜像分别交互选择 **全部删除 / 逐个确认 / 跳过**。
 
 提供 **x86_64、ARM64（aarch64）静态 musl 二进制**，目标机器无需 Rust、Python 或项目运行时。文件扫描和删除由 Rust 直接完成；容器清理调用机器上已有的 Podman / Docker，系统清理按需调用 dnf5 / apt-get / journalctl。
 
 ## 安装
 
-从 [Releases](https://github.com/omeyang/cleanup/releases) 下载与你的 `uname -m` 对应的 `cleanup-linux-x86_64` 或 `cleanup-linux-aarch64`。`SHA256SUMS` 与二进制位于同一发布页。
+从 [Releases](https://github.com/omeyang/cloacina/releases) 下载与你的 `uname -m` 对应的 `cloacina-linux-x86_64` 或 `cloacina-linux-aarch64`。`SHA256SUMS` 与二进制位于同一发布页。
 
-使用已登录并具有仓库访问权限的 GitHub CLI 下载（适用于私有或公开仓库）：
+仓库和发布包均公开，无需 GitHub 账号。下载与你的架构匹配的二进制，核对 SHA-256 后安装：
 
 ```sh
-mkdir -p cleanup-download
-gh release download --repo omeyang/cleanup --dir cleanup-download
 (
-  cd cleanup-download
+  set -eu
+  cloacina_asset="cloacina-linux-$(uname -m)"
+  case "$cloacina_asset" in
+    cloacina-linux-x86_64|cloacina-linux-aarch64) ;;
+    *) printf '暂不提供当前架构的二进制\n' >&2; exit 1 ;;
+  esac
+  mkdir -p cloacina-download
+  cd cloacina-download
+  cloacina_release='https://github.com/omeyang/cloacina/releases/latest/download'
+  curl -fL "$cloacina_release/$cloacina_asset" -o "$cloacina_asset"
+  curl -fL "$cloacina_release/SHA256SUMS" -o SHA256SUMS
+  sha256sum --check --ignore-missing SHA256SUMS
+  mkdir -p "$HOME/.local/bin"
+  install -m 755 "$cloacina_asset" "$HOME/.local/bin/cloacina"
+)
+cloacina --version
+```
+
+也可以使用 GitHub CLI：
+
+```sh
+mkdir -p cloacina-download
+gh release download --repo omeyang/cloacina --dir cloacina-download
+(
+  cd cloacina-download
   sha256sum -c SHA256SUMS
 )
 mkdir -p "$HOME/.local/bin"
-install -m 755 "cleanup-download/cleanup-linux-$(uname -m)" "$HOME/.local/bin/cleanup"
-cleanup --version
+install -m 755 "cloacina-download/cloacina-linux-$(uname -m)" "$HOME/.local/bin/cloacina"
+cloacina --version
 ```
 
 确保 `~/.local/bin` 在 `PATH` 中。二进制也可以直接复制到另一台相同架构的 Linux 机器运行。只支持 64 位 Linux；不适用于 macOS、Windows 或 32 位 ARM。
@@ -27,14 +55,14 @@ cleanup --version
 ## 用法
 
 ```sh
-cleanup -an                 # 预览全部清理项目，不修改数据
-cleanup -a                  # 全部清理；容器、镜像仍需交互选择
-cleanup                     # 常规文件清理 + 容器/镜像交互
-cleanup --containers        # 只清容器和镜像
-cleanup --skip-containers   # 只清文件
-cleanup --engine docker     # 只询问 Docker 的容器和镜像
-cleanup --keep .bashrc --keep .venvs/work
-cleanup --help
+cloacina -an                 # 预览全部清理项目，不修改数据
+cloacina -a                  # 全部清理；容器、镜像仍需交互选择
+cloacina                     # 常规文件清理 + 容器/镜像交互
+cloacina --containers        # 只清容器和镜像
+cloacina --skip-containers   # 只清文件
+cloacina --engine docker     # 只询问 Docker 的容器和镜像
+cloacina --keep .bashrc --keep .venvs/work
+cloacina --help
 ```
 
 `--deep`、`--system`、`--containers-only`、`-d 30` 继续兼容原脚本。`--all` / `-a` 等于常规清理 + `--deep --system`，不需要再加 `--containers-only`；后者表示“仅容器/镜像”，不能与全部清理组合。
@@ -54,7 +82,7 @@ cleanup --help
 | `--system` | 超过 1 天的轮转日志；`journalctl --vacuum-time=14d`，需要 root |
 | 容器与镜像 | 自动检测已安装的 Podman / Docker，同一镜像的多个标签合并询问 |
 
-**文件清理按照清单直接执行。** 换机器时先运行 `cleanup -an`：清单包含 Bash 配置和整个 `.venvs`，需要保留时使用可重复的 `--keep PATH`。相对保留路径以家目录为基准。`--keep` 只保护文件路径，不改变包管理器、journal 或容器清理。
+**文件清理按照清单直接执行。** 换机器时先运行 `cloacina -an`：清单包含 Bash 配置和整个 `.venvs`，需要保留时使用可重复的 `--keep PATH`。相对保留路径以家目录为基准。`--keep` 只保护文件路径，不改变包管理器、journal 或容器清理。
 
 `--keep-days` 调整 AI 会话保留天数，`--tmp-days` 调整临时文件保留天数，`--journal-days` 调整 journal 保留天数。家目录来自当前进程的 `HOME`；程序不自动提权，`sudo` 后的 `HOME` 可能不同。
 
@@ -83,13 +111,22 @@ cargo build --release --locked --target x86_64-unknown-linux-musl
 cargo build --release --locked --target aarch64-unknown-linux-musl
 ```
 
-项目使用 Rust 自带的 `rust-lld` 链接器，无需单独安装 musl-gcc 或跨架构 C 工具链。GitHub Actions 对两种架构构建并验证，推送 `v*` 标签后发布二进制和 SHA-256 校验清单。
+项目使用 Rust 自带的 `rust-lld` 链接器，无需单独安装 musl-gcc 或跨架构 C 工具链。
+
+## GitHub Actions
+
+- [CI](https://github.com/omeyang/cloacina/actions/workflows/ci.yml)：每次推送到 `main` 或提交 PR，分别在 x86_64、ARM64 原生 runner 上运行格式检查、Clippy、测试、静态构建和二进制启动检查；x86_64 还运行隔离 Podman 集成测试。支持手动触发。
+- [Release](https://github.com/omeyang/cloacina/actions/workflows/release.yml)：推送 `v*` 标签时，检查标签与 Cargo 版本一致，测试并构建两种架构，发布 `cloacina-linux-x86_64`、`cloacina-linux-aarch64` 和 `SHA256SUMS`。
 
 隔离 Podman 集成测试（仅在临时存储内创建测试容器和镜像）：
 
 ```sh
-python3.12 tests/integration_podman.py target/x86_64-unknown-linux-musl/release/cleanup
+python3.12 tests/integration_podman.py target/x86_64-unknown-linux-musl/release/cloacina
 ```
+
+## 从 cleanup 迁移
+
+项目和命令从 v0.2.0 起统一命名为 `cloacina`。原有参数保持兼容；`cloacina -a` 对应原来的 `cleanup -a`。旧版 `v0.1.0` 保留在发布历史中。
 
 ## License
 

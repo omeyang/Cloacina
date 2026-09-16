@@ -100,7 +100,7 @@ fn main() -> ExitCode {
         Ok(0) => ExitCode::SUCCESS,
         Ok(_) => ExitCode::FAILURE,
         Err(error) => {
-            eprintln!("cleanup: {error:#}");
+            eprintln!("cloacina: {error:#}");
             ExitCode::FAILURE
         }
     }

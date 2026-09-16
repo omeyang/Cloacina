@@ -1,11 +1,11 @@
 [package]
-name = "cleanup"
-version = "0.1.0"
+name = "cloacina"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Portable Linux cleanup with interactive Podman and Docker cleanup"
+description = "Cloacina: portable Linux cleanup with interactive Podman and Docker cleanup"
 license = "MIT"
-repository = "https://github.com/omeyang/cleanup"
+repository = "https://github.com/omeyang/cloacina"
 publish = false
 
 [dependencies]

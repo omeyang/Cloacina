@@ -638,7 +638,7 @@ mod tests {
             .unwrap();
     }
     fn opts(args: &[&str]) -> Options {
-        Options::parse_from(std::iter::once("cleanup").chain(args.iter().copied()))
+        Options::parse_from(std::iter::once("cloacina").chain(args.iter().copied()))
     }
 
     #[test]

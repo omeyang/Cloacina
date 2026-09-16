@@ -27,7 +27,7 @@ def main():
             text=True).splitlines()) for kind in ('ps', 'images'))
 
     before = host_snapshot()
-    with tempfile.TemporaryDirectory(prefix='cleanup-podman-integration-') as temp:
+    with tempfile.TemporaryDirectory(prefix='cloacina-podman-integration-') as temp:
         root = Path(temp)
         test_home = root / 'home'
         test_home.mkdir()
@@ -49,13 +49,13 @@ def main():
             (context / 'marker').write_text(kind)
             (context / 'Containerfile').write_text(
                 'FROM scratch\nCOPY marker /marker\nCMD ["/not-run"]\n')
-            podman('build', '--pull=never', '-q', '-t', f'localhost/cleanup-{kind}:one', str(context))
-            podman('tag', f'localhost/cleanup-{kind}:one', f'localhost/cleanup-{kind}:two')
-            podman('create', '--network=none', '--name', f'cleanup-{kind}',
-                   f'localhost/cleanup-{kind}:one')
-        podman('volume', 'create', 'cleanup-preserved-volume')
+            podman('build', '--pull=never', '-q', '-t', f'localhost/cloacina-{kind}:one', str(context))
+            podman('tag', f'localhost/cloacina-{kind}:one', f'localhost/cloacina-{kind}:two')
+            podman('create', '--network=none', '--name', f'cloacina-{kind}',
+                   f'localhost/cloacina-{kind}:one')
+        podman('volume', 'create', 'cloacina-preserved-volume')
         keep_tags = podman('image', 'inspect', '--format', '{{json .RepoTags}}',
-                           'localhost/cleanup-keep:one')
+                           'localhost/cloacina-keep:one')
         isolated_bin = root / 'bin'
         isolated_bin.mkdir()
         wrapper = isolated_bin / 'podman'
@@ -93,7 +93,7 @@ def main():
                         if match.group(1) is None:
                             answer = {'all': '1', 'each': '2', 'skip': ''}[mode]
                         elif match.group(1) == '容器':
-                            answer = 'y' if 'cleanup-drop' in match.group(2) else 'n'
+                            answer = 'y' if 'cloacina-drop' in match.group(2) else 'n'
                         else:
                             answer = 'y'
                         os.write(master, (answer + '\n').encode())
@@ -118,18 +118,18 @@ def main():
         code, output = interact('each')
         assert code == 1, (code, output)
         assert '保留镜像及标签' in output, output
-        assert podman('ps', '--all', '--format', '{{.Names}}') == 'cleanup-keep'
+        assert podman('ps', '--all', '--format', '{{.Names}}') == 'cloacina-keep'
         assert podman('image', 'inspect', '--format', '{{json .RepoTags}}',
-                      'localhost/cleanup-keep:one') == keep_tags
-        assert 'cleanup-drop' not in podman('images', '--format', '{{.Repository}}:{{.Tag}}')
-        assert podman('volume', 'ls', '--format', '{{.Name}}') == 'cleanup-preserved-volume'
+                      'localhost/cloacina-keep:one') == keep_tags
+        assert 'cloacina-drop' not in podman('images', '--format', '{{.Repository}}:{{.Tag}}')
+        assert podman('volume', 'ls', '--format', '{{.Name}}') == 'cloacina-preserved-volume'
         print('PASS: individual choices, multiple tags and referenced-image protection', flush=True)
 
         code, output = interact('all')
         assert code == 0, (code, output)
         assert podman('ps', '--all', '--quiet') == ''
         assert podman('images', '--all', '--quiet') == ''
-        assert podman('volume', 'ls', '--format', '{{.Name}}') == 'cleanup-preserved-volume'
+        assert podman('volume', 'ls', '--format', '{{.Name}}') == 'cloacina-preserved-volume'
         print('PASS: all selected resources deleted; volumes preserved', flush=True)
 
     assert host_snapshot() == before, 'Host resources changed during test'
