@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+      - name: Verify release version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          package_version=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[0].version')
+          test "$RELEASE_TAG" = "v$package_version"
+      - run: cargo test --locked --target ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package static binary
+        run: |
+          target/${{ matrix.target }}/release/cleanup --version
+          if readelf -l target/${{ matrix.target }}/release/cleanup | grep -q INTERP; then
+            echo 'Unexpected dynamic loader' >&2
+            exit 1
+          fi
+          mkdir -p dist
+          install -m 755 target/${{ matrix.target }}/release/cleanup dist/cleanup-linux-${{ matrix.arch }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cleanup-linux-${{ matrix.arch }}
+          path: dist/cleanup-linux-${{ matrix.arch }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: cleanup-linux-*
+          merge-multiple: true
+          path: dist
+      - name: Publish binaries and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          (cd dist && sha256sum cleanup-linux-* > SHA256SUMS)
+          gh release create "$RELEASE_TAG" dist/cleanup-linux-* dist/SHA256SUMS \
+            --verify-tag --title "cleanup $RELEASE_TAG" --notes-file .github/release-notes.md
