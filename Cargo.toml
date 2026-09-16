@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 description = "Cloacina: portable Linux cleanup with interactive Podman and Docker cleanup"
 license = "MIT"
-repository = "https://github.com/omeyang/cloacina"
+repository = "https://github.com/omeyang/Cloacina"
 publish = false
 
 [dependencies]

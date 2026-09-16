@@ -1,4 +1,4 @@
-Cloacina：以古罗马排水与净化女神命名的 Rust Linux 清理工具。项目和命令由 cleanup 更名为 cloacina，仓库及下载包均公开。
+Cloacina：以古罗马排水与净化女神命名的 Rust Linux 清理工具。项目由 cleanup 更名为 Cloacina，命令为 `cloacina`，仓库及下载包均公开。
 
 - `cloacina -a`：全部清理；`cloacina -an`：预览全部。
 - Podman / Docker 容器和镜像分别选择全部删除、逐个确认或跳过。
