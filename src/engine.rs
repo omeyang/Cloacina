@@ -27,6 +27,9 @@ pub struct Item {
 
 impl Item {
     fn label(&self) -> String {
+        if self.names.len() == 1 && self.names[0] == self.id {
+            return format!("{}  [{}]", self.id, self.detail);
+        }
         let id = self.id.strip_prefix("sha256:").unwrap_or(&self.id);
         format!(
             "{}  {}  [{}]",
@@ -80,6 +83,33 @@ fn inventory(text: &str, images: bool) -> Result<Vec<Item>> {
 fn valid_id(id: &str) -> bool {
     let id = id.strip_prefix("sha256:").unwrap_or(id);
     !id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn volume_inventory(text: &str) -> Result<Vec<Item>> {
+    let mut items = Vec::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let Some((name, driver)) = line.split_once('|') else {
+            bail!("容器引擎返回了无法识别的卷清单：{line}");
+        };
+        if !name
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+            || driver.is_empty()
+            || driver.contains('|')
+        {
+            bail!("容器引擎返回了无法识别的卷清单：{line}");
+        }
+        items.push(Item {
+            id: name.to_owned(),
+            names: vec![name.to_owned()],
+            detail: format!("{driver}，未被容器引用"),
+        });
+    }
+    Ok(items)
 }
 
 fn local_socket(endpoint: String) -> Result<String> {
@@ -221,6 +251,20 @@ impl Engine {
         .is_empty())
     }
 
+    fn volumes(&self, runner: &dyn Runner) -> Result<Vec<Item>> {
+        volume_inventory(&checked(
+            runner,
+            &self.command(&[
+                "volume",
+                "ls",
+                "--filter",
+                "dangling=true",
+                "--format",
+                "{{.Name}}|{{.Driver}}",
+            ]),
+        )?)
+    }
+
     fn remove_image(&self, runner: &dyn Runner, image: &Item) -> Result<()> {
         if self.in_use(runner, image)? {
             bail!("镜像仍被容器引用，保留镜像及标签");
@@ -241,7 +285,62 @@ impl Engine {
                 errors += 1;
             }
         }
+        // Scan after container removal so newly orphaned volumes are included.
+        if let Err(error) = self.volume_group(runner, prompts, dry_run) {
+            eprintln!("  {}：{error:#}", self.name());
+            errors += 1;
+        }
         errors
+    }
+
+    fn volume_group(
+        &self,
+        runner: &dyn Runner,
+        prompts: &mut dyn Prompts,
+        dry_run: bool,
+    ) -> Result<()> {
+        println!("\n▸ 本机 {} 未被容器引用的卷", self.name());
+        let items = self.volumes(runner)?;
+        if dry_run {
+            println!("  仅列出当前未被引用的卷；实际删除容器后会重新扫描，可能出现更多候选。");
+        }
+        if items.is_empty() {
+            println!("  没有未被容器引用的卷。");
+            return Ok(());
+        }
+        for item in &items {
+            println!("  {}", item.label());
+        }
+        if dry_run {
+            println!("  以上为清理候选；实际运行时交互选择。");
+            return Ok(());
+        }
+        println!(
+            "  包含命名卷和匿名卷；删除会永久移除卷内数据。仍被容器（含已停止容器）引用的卷保留。"
+        );
+        let selected = select(&items, "卷", prompts)?;
+        if selected.is_empty() {
+            println!("  已跳过卷清理。");
+            return Ok(());
+        }
+        let mut failures = 0;
+        for item in &selected {
+            // Never force removal: Podman --force would also remove dependent containers.
+            // The engine rejects volumes that became referenced after inventory/confirmation.
+            if let Err(error) = checked(runner, &self.command(&["volume", "rm", &item.id])) {
+                eprintln!("  保留卷 {}：{error:#}", item.id);
+                failures += 1;
+            }
+        }
+        println!(
+            "  已删除 {} 个卷，保留 {} 个。",
+            selected.len() - failures,
+            failures
+        );
+        if failures > 0 {
+            bail!("{failures} 个选中的卷未能删除");
+        }
+        Ok(())
     }
 
     fn group(
@@ -502,6 +601,181 @@ mod tests {
             Ok(self.answers.pop_front().unwrap())
         }
     }
+
+    const VOLUME_LS: &[&str] = &[
+        "--remote=false",
+        "volume",
+        "ls",
+        "--filter",
+        "dangling=true",
+        "--format",
+        "{{.Name}}|{{.Driver}}",
+    ];
+
+    #[test]
+    fn volumes_accept_names_and_anonymous_ids_but_reject_invalid_inventory() {
+        let anonymous = "a".repeat(64);
+        let items =
+            volume_inventory(&format!("project_database-1.0|local\n{anonymous}|local\n")).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id, "project_database-1.0");
+        assert!(items[0].label().contains("project_database-1.0"));
+        assert_eq!(items[1].id, anonymous);
+        for invalid in [
+            "--all|local",
+            "-f|local",
+            "|local",
+            "bad/name|local",
+            "a|",
+            "a|b|c",
+            "a",
+        ] {
+            assert!(volume_inventory(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn volume_preview_and_skip_never_delete() {
+        for (dry_run, mode) in [(true, Mode::Each), (false, Mode::Skip)] {
+            let runner = FakeRunner::new(&[(VOLUME_LS, 0, "database|local")]);
+            let mut choices = Choices {
+                mode,
+                answers: VecDeque::new(),
+            };
+            podman()
+                .volume_group(&runner, &mut choices, dry_run)
+                .unwrap();
+            assert!(runner.results.borrow().is_empty());
+            assert_eq!(runner.calls.borrow().len(), 1);
+        }
+    }
+
+    #[test]
+    fn volume_each_only_deletes_confirmed_names_and_quit_skips_remaining() {
+        let runner = FakeRunner::new(&[
+            (
+                VOLUME_LS,
+                0,
+                "keep|local\ndrop|local\nquit|local\nafter|local",
+            ),
+            (&["--remote=false", "volume", "rm", "drop"], 0, "drop"),
+        ]);
+        let mut choices = Choices {
+            mode: Mode::Each,
+            answers: [Answer::No, Answer::Yes, Answer::Quit].into(),
+        };
+        podman().volume_group(&runner, &mut choices, false).unwrap();
+        assert!(runner.results.borrow().is_empty());
+        assert!(choices.answers.is_empty());
+    }
+
+    #[test]
+    fn volume_removal_failure_does_not_force_or_stop_other_selected_removals() {
+        let runner = FakeRunner::new(&[
+            (VOLUME_LS, 0, "now-in-use|local\nunused|local"),
+            (
+                &["--remote=false", "volume", "rm", "now-in-use"],
+                2,
+                "volume is in use",
+            ),
+            (&["--remote=false", "volume", "rm", "unused"], 0, "unused"),
+        ]);
+        let mut choices = Choices {
+            mode: Mode::All,
+            answers: VecDeque::new(),
+        };
+        assert!(podman().volume_group(&runner, &mut choices, false).is_err());
+        assert!(runner.results.borrow().is_empty());
+    }
+
+    #[test]
+    fn docker_volumes_use_the_pinned_socket_for_listing_and_removal() {
+        let runner = FakeRunner::new(&[
+            (
+                &[
+                    "--host",
+                    "unix:///var/run/docker.sock",
+                    "volume",
+                    "ls",
+                    "--filter",
+                    "dangling=true",
+                    "--format",
+                    "{{.Name}}|{{.Driver}}",
+                ],
+                0,
+                "project_data|local",
+            ),
+            (
+                &[
+                    "--host",
+                    "unix:///var/run/docker.sock",
+                    "volume",
+                    "rm",
+                    "project_data",
+                ],
+                0,
+                "",
+            ),
+        ]);
+        let engine = Engine {
+            kind: Kind::Docker,
+            program: "docker".into(),
+            socket: Some("unix:///var/run/docker.sock".into()),
+        };
+        let mut choices = Choices {
+            mode: Mode::All,
+            answers: VecDeque::new(),
+        };
+        engine.volume_group(&runner, &mut choices, false).unwrap();
+        assert!(runner.results.borrow().is_empty());
+        assert!(
+            runner
+                .calls
+                .borrow()
+                .iter()
+                .all(|call| call.remove_env.contains(&"DOCKER_CONTEXT"))
+        );
+    }
+
+    #[test]
+    fn cleanup_scans_volumes_after_removing_containers_even_if_image_listing_fails() {
+        let runner = FakeRunner::new(&[
+            (
+                &[
+                    "--remote=false",
+                    "ps",
+                    "--all",
+                    "--no-trunc",
+                    "--format",
+                    "{{.ID}}|{{.Names}}|{{.Status}}|{{.Image}}",
+                ],
+                0,
+                "abc|app|stopped|image",
+            ),
+            (&["--remote=false", "rm", "--force", "abc"], 0, ""),
+            (
+                &[
+                    "--remote=false",
+                    "images",
+                    "--all",
+                    "--no-trunc",
+                    "--format",
+                    "{{.ID}}|{{.Repository}}:{{.Tag}}|{{.Size}}",
+                ],
+                125,
+                "image listing failed",
+            ),
+            (VOLUME_LS, 0, "orphan|local"),
+            (&["--remote=false", "volume", "rm", "orphan"], 0, ""),
+        ]);
+        let mut choices = Choices {
+            mode: Mode::All,
+            answers: VecDeque::new(),
+        };
+        assert_eq!(podman().cleanup(&runner, &mut choices, false), 1);
+        assert!(runner.results.borrow().is_empty());
+    }
+
     #[test]
     fn each_and_quit_only_select_approved_items() {
         let items = inventory("aaa|a|running\nbbb|b|stopped\nccc|c|stopped", false).unwrap();

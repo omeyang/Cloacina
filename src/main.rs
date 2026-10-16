@@ -1,3 +1,4 @@
+mod activity;
 mod cli;
 mod command;
 mod engine;
@@ -61,9 +62,9 @@ fn run(options: &cli::Options) -> Result<usize> {
     let roots = files::Roots::from_environment()?;
     let runner = SystemRunner;
     let mut errors = 0;
-    if !options.skip_containers {
+    if !options.skip_containers && !options.targeted() {
         if !options.dry_run && !io::stdin().is_terminal() {
-            println!("▸ 未检测到交互终端，跳过容器和镜像；使用 -n 可预览候选。");
+            println!("▸ 未检测到交互终端，跳过容器、镜像和卷；使用 -n 可预览候选。");
         } else {
             let (engines, notices) = engine::discover(options.engine, &runner);
             for notice in &notices {

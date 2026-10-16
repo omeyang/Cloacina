@@ -1,3 +1,4 @@
+use crate::activity::{Activity, CargoLocks};
 use crate::cli::Options;
 use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
@@ -33,6 +34,9 @@ pub struct Roots {
     pub home: PathBuf,
     pub tmp: PathBuf,
     pub logs: PathBuf,
+    pub shm: PathBuf,
+    pub proc: PathBuf,
+    pub cargo_home: PathBuf,
     pub uid: u32,
     pub mounts: Vec<PathBuf>,
 }
@@ -47,7 +51,20 @@ impl Roots {
         // SAFETY: geteuid has no arguments or memory-safety preconditions.
         let uid = unsafe { libc::geteuid() };
         Ok(Self {
+            cargo_home: std::env::var_os("CARGO_HOME")
+                .map(PathBuf::from)
+                .map(|path| -> std::io::Result<PathBuf> {
+                    if path.is_absolute() {
+                        Ok(path)
+                    } else {
+                        Ok(std::env::current_dir()?.join(path))
+                    }
+                })
+                .transpose()?
+                .unwrap_or_else(|| home.join(".cargo")),
             home,
+            shm: "/dev/shm".into(),
+            proc: "/proc".into(),
             tmp: "/tmp".into(),
             logs: "/var/log".into(),
             uid,
@@ -112,13 +129,28 @@ impl From<&Metadata> for Identity {
     }
 }
 
+#[derive(Clone, Debug)]
+enum Policy {
+    Regular,
+    Temporary {
+        days: u64,
+        root: PathBuf,
+    },
+    Version {
+        current: PathBuf,
+        versions: PathBuf,
+        root: PathBuf,
+    },
+    CargoCache,
+}
+
 #[derive(Debug)]
 pub struct Entry {
     pub path: PathBuf,
     pub section: &'static str,
     pub bytes: u64,
     identity: Identity,
-    temporary: bool,
+    policy: Policy,
 }
 
 #[derive(Default, Debug)]
@@ -133,6 +165,7 @@ struct Planner<'a> {
     keep: Vec<PathBuf>,
     seen: HashSet<PathBuf>,
     plan: Plan,
+    activity: Option<Activity>,
 }
 
 impl Plan {
@@ -157,10 +190,29 @@ impl Plan {
             keep,
             seen: HashSet::new(),
             plan: Self::default(),
+            activity: None,
         };
-        planner.basic(options);
-        if options.deep || options.all {
-            planner.old_binaries();
+        if !options.targeted() {
+            planner.basic(options);
+        }
+        if options.deep || options.all || options.targeted() {
+            match Activity::scan(&roots.proc, roots.uid) {
+                Ok(activity) => planner.activity = Some(activity),
+                Err(error) => planner.plan.notices.push(format!(
+                    "无法核实进程占用，保留共享内存、工具旧版本和 Cargo 缓存：{error:#}"
+                )),
+            }
+            if planner.activity.is_some() {
+                if options.deep || options.all || options.old_versions {
+                    planner.old_binaries();
+                }
+                if options.deep || options.all || options.cargo_cache {
+                    planner.cargo_cache();
+                }
+                if options.deep || options.all || options.memory {
+                    planner.shared_memory(options.shm_days);
+                }
+            }
         }
         if (options.system || options.all) && roots.uid == 0 {
             planner.old_files(&roots.logs, 1, FileFilter::Logs, "轮转系统日志", false);
@@ -176,6 +228,11 @@ impl Plan {
         let mut done = 0;
         let mut errors = 0;
         let mut bytes = 0;
+        let mut memory_bytes = 0;
+        // Retain these locks through the whole deletion pass. A build must not
+        // start reading caches in between two cache-directory removals.
+        let mut cargo_locks = None;
+        let mut cargo_lock_failed = false;
         for entry in &self.entries {
             if section != entry.section {
                 section = entry.section;
@@ -188,10 +245,28 @@ impl Plan {
                     human(entry.bytes)
                 );
                 done += 1;
-                bytes += entry.bytes;
+                if entry.path.starts_with(&roots.shm) {
+                    memory_bytes += entry.bytes;
+                } else {
+                    bytes += entry.bytes;
+                }
                 continue;
             }
-            match delete_entry(entry, roots, options.tmp_days) {
+            if matches!(entry.policy, Policy::CargoCache) && cargo_locks.is_none() {
+                if cargo_lock_failed {
+                    continue;
+                }
+                match CargoLocks::acquire(&roots.cargo_home) {
+                    Ok(locks) => cargo_locks = Some(locks),
+                    Err(error) => {
+                        eprintln!("  未删除 Cargo 缓存：{error:#}");
+                        errors += 1;
+                        cargo_lock_failed = true;
+                        continue;
+                    }
+                }
+            }
+            match delete_entry(entry, roots) {
                 Ok(()) => {
                     println!(
                         "  已删除  {}  ({})",
@@ -199,7 +274,11 @@ impl Plan {
                         human(entry.bytes)
                     );
                     done += 1;
-                    bytes += entry.bytes;
+                    if entry.path.starts_with(&roots.shm) {
+                        memory_bytes += entry.bytes;
+                    } else {
+                        bytes += entry.bytes;
+                    }
                 }
                 Err(error) => {
                     eprintln!("  未删除 {}：{error:#}", entry.path.display());
@@ -208,9 +287,10 @@ impl Plan {
             }
         }
         println!(
-            "\n文件{}：{done} 项，估算 {}。",
+            "\n文件{}：{done} 项，估算磁盘 {}，共享内存 {}。",
             if options.dry_run { "预演" } else { "清理" },
-            human(bytes)
+            human(bytes),
+            human(memory_bytes)
         );
         errors
     }
@@ -284,12 +364,21 @@ fn old(meta: &Metadata, days: u64, now: SystemTime) -> bool {
 fn protected_tmp_name(name: &OsStr) -> bool {
     let name = name.to_string_lossy();
     name.starts_with("systemd-private-")
+        || name.starts_with("sem.")
+        || name.starts_with("aliyun-assist-")
         || name.starts_with("ssh-")
         || name.ends_with(".sock")
         || name.ends_with(".lock")
+        || name.ends_with("-lock")
         || matches!(
             name.as_ref(),
-            "claude-0" | ".X11-unix" | ".ICE-unix" | ".font-unix" | ".XIM-unix" | ".Test-unix"
+            "claude-0"
+                | "libpod_lock"
+                | ".X11-unix"
+                | ".ICE-unix"
+                | ".font-unix"
+                | ".XIM-unix"
+                | ".Test-unix"
         )
 }
 
@@ -357,7 +446,7 @@ impl Planner<'_> {
         }
     }
 
-    fn add(&mut self, path: PathBuf, section: &'static str, temporary: bool) {
+    fn add(&mut self, path: PathBuf, section: &'static str, policy: Policy) {
         if self.keep.iter().any(|keep| path.starts_with(keep)) || self.seen.contains(&path) {
             return;
         }
@@ -380,7 +469,7 @@ impl Planner<'_> {
         if self.keep.iter().any(|keep| keep.starts_with(&path)) {
             if meta.is_dir() {
                 for child in self.children(&path) {
-                    self.add(child, section, temporary);
+                    self.add(child, section, policy.clone());
                 }
             }
             return;
@@ -394,7 +483,7 @@ impl Planner<'_> {
                     section,
                     bytes,
                     identity: Identity::from(&meta),
-                    temporary,
+                    policy,
                 });
             }
             Err(error) => self
@@ -409,13 +498,13 @@ impl Planner<'_> {
             self.add(
                 self.roots.home.join(name),
                 "家目录指定文件与虚拟环境",
-                false,
+                Policy::Regular,
             );
         }
         for path in self.children(&self.roots.home) {
             let name = path.file_name().unwrap().to_string_lossy();
             if name.starts_with(".zcompdump") || name.starts_with(".claude.json.tmp.") {
-                self.add(path, "家目录指定文件与虚拟环境", false);
+                self.add(path, "家目录指定文件与虚拟环境", Policy::Regular);
             }
         }
         let cache = self.roots.home.join(".cache");
@@ -425,7 +514,7 @@ impl Planner<'_> {
                 .push(format!("{} 是符号链接，保留目标目录", cache.display()));
         }
         for path in self.children(&cache) {
-            self.add(path, "家目录缓存（保留 gitstatus）", false);
+            self.add(path, "家目录缓存（保留 gitstatus）", Policy::Regular);
         }
         self.old_files(
             &self.roots.home.join(".codex/sessions"),
@@ -446,7 +535,11 @@ impl Planner<'_> {
             ".claude/shell-snapshots",
             ".claude/paste-cache",
         ] {
-            self.add(self.roots.home.join(name), "可重建状态与快照", false);
+            self.add(
+                self.roots.home.join(name),
+                "可重建状态与快照",
+                Policy::Regular,
+            );
         }
         for path in self.children(&self.roots.home.join(".codex")) {
             if path
@@ -455,7 +548,7 @@ impl Planner<'_> {
                 .to_string_lossy()
                 .starts_with("logs_2.sqlite")
             {
-                self.add(path, "可重建状态与快照", false);
+                self.add(path, "可重建状态与快照", Policy::Regular);
             }
         }
         for path in self.children(&self.roots.tmp) {
@@ -477,7 +570,11 @@ impl Planner<'_> {
         };
         if temporary_tree_is_old(&path, self.roots.uid, days, self.now, meta.dev()).unwrap_or(false)
         {
-            self.add(path, "过期临时文件（保留活跃端点及近期内容）", true);
+            self.add(
+                path.clone(),
+                "过期临时文件（保留活跃端点及近期内容）",
+                Policy::Temporary { days, root: path },
+            );
         }
     }
 
@@ -502,25 +599,156 @@ impl Planner<'_> {
             if meta.is_dir() {
                 self.old_files(&path, days, filter, section, protect_memory);
             } else if meta.is_file() && filter.matches(&path) && old(&meta, days, self.now) {
-                self.add(path, section, false);
+                self.add(path, section, Policy::Regular);
             }
         }
     }
 
-    fn old_binaries(&mut self) {
-        let standalone = self.roots.home.join(".codex/packages/standalone");
-        if let (Ok(current), Ok(releases)) = (
-            fs::canonicalize(standalone.join("current")),
-            fs::canonicalize(standalone.join("releases")),
-        ) {
-            if current.starts_with(&releases) {
-                for release in self.children(&standalone.join("releases")) {
-                    if fs::canonicalize(&release).is_ok_and(|p| p != current) {
-                        self.add(release, "旧版本二进制", false);
-                    }
-                }
+    fn shared_memory(&mut self, days: u64) {
+        for path in self.children(&self.roots.shm) {
+            self.shared_temporary(path.clone(), days, &path);
+        }
+    }
+
+    fn shared_temporary(&mut self, path: PathBuf, days: u64, root: &Path) {
+        if contains_mount(&path, &self.roots.mounts) {
+            return;
+        }
+        if self
+            .activity
+            .as_ref()
+            .is_some_and(|activity| activity.uses(&path))
+        {
+            self.plan
+                .notices
+                .push(format!("{} 仍被进程使用", path.display()));
+            return;
+        }
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            return;
+        };
+        if meta.uid() != self.roots.uid
+            || !old(&meta, days, self.now)
+            || path.file_name().is_some_and(protected_tmp_name)
+        {
+            return;
+        }
+        if temporary_tree_is_old(&path, self.roots.uid, days, self.now, meta.dev()).unwrap_or(false)
+        {
+            self.add(
+                path,
+                "共享内存中的过期临时文件",
+                Policy::Temporary {
+                    days,
+                    root: root.to_owned(),
+                },
+            );
+        } else if meta.is_dir() {
+            // A retained lock file must not keep gigabytes of unrelated, idle
+            // build output alive. Recurse without removing the protected entry.
+            for child in self.children(&path) {
+                self.shared_temporary(child, days, root);
             }
         }
+    }
+
+    fn cargo_cache(&mut self) {
+        if !self.roots.cargo_home.is_absolute() || self.roots.cargo_home == Path::new("/") {
+            self.plan.notices.push("Cargo 家目录无效，保留缓存".into());
+            return;
+        }
+        if let Err(error) = CargoLocks::probe(&self.roots.cargo_home) {
+            self.plan
+                .notices
+                .push(format!("保留 Cargo 缓存：{error:#}"));
+            return;
+        }
+        for name in ["registry", "git", "advisory-db"] {
+            let path = self.roots.cargo_home.join(name);
+            if self
+                .activity
+                .as_ref()
+                .is_some_and(|activity| activity.uses(&path))
+            {
+                self.plan
+                    .notices
+                    .push(format!("{} 仍被进程使用", path.display()));
+                continue;
+            }
+            if fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+                self.plan
+                    .notices
+                    .push(format!("{} 是符号链接，保留缓存", path.display()));
+                continue;
+            }
+            self.add(
+                path,
+                "Cargo 依赖与检查缓存（保留 bin、配置、凭据和锁文件）",
+                Policy::CargoCache,
+            );
+        }
+    }
+
+    fn versioned(&mut self, versions: &Path, current_link: &Path) {
+        if !versions.exists() {
+            return;
+        }
+        let resolve = || -> Result<(PathBuf, PathBuf)> {
+            let current = fs::canonicalize(current_link)?;
+            let directory = fs::canonicalize(versions)?;
+            if current == directory || !current.starts_with(&directory) {
+                bail!("当前版本不在版本目录内");
+            }
+            Ok((current, directory))
+        };
+        let (current, directory) = match resolve() {
+            Ok(paths) => paths,
+            Err(error) => {
+                self.plan.notices.push(format!(
+                    "无法识别 {} 当前版本，保留所有版本：{error:#}",
+                    versions.display()
+                ));
+                return;
+            }
+        };
+        for version in self.children(versions) {
+            if fs::symlink_metadata(&version).is_ok_and(|meta| meta.file_type().is_symlink()) {
+                continue;
+            }
+            if current.starts_with(&version) {
+                continue;
+            }
+            if self
+                .activity
+                .as_ref()
+                .is_some_and(|activity| activity.uses(&version))
+            {
+                self.plan
+                    .notices
+                    .push(format!("{} 仍被进程使用，保留该版本", version.display()));
+                continue;
+            }
+            self.add(
+                version.clone(),
+                "旧版本二进制",
+                Policy::Version {
+                    current: current_link.to_owned(),
+                    versions: directory.clone(),
+                    root: version,
+                },
+            );
+        }
+    }
+
+    fn old_binaries(&mut self) {
+        for package in ["standalone", "app-server-daemon"] {
+            let root = self.roots.home.join(".codex/packages").join(package);
+            self.versioned(&root.join("releases"), &root.join("current"));
+        }
+        self.versioned(
+            &self.roots.home.join(".local/share/claude/versions"),
+            &self.roots.home.join(".local/bin/claude"),
+        );
         let server = self.roots.home.join(".vscode-server");
         let lru = server.join("cli/servers/lru.json");
         if !lru.exists() {
@@ -543,14 +771,14 @@ impl Planner<'_> {
                 for path in self.children(&server.join("cli/servers")) {
                     let name = path.file_name().unwrap().to_string_lossy();
                     if name.starts_with("Stable-") && name != *current {
-                        self.add(path, "旧版本二进制", false);
+                        self.add(path, "旧版本二进制", Policy::Regular);
                     }
                 }
                 let current_cli = format!("code-{}", current.trim_start_matches("Stable-"));
                 for path in self.children(&server) {
                     let name = path.file_name().unwrap().to_string_lossy();
                     if name.starts_with("code-") && name != current_cli {
-                        self.add(path, "旧版本二进制", false);
+                        self.add(path, "旧版本二进制", Policy::Regular);
                     }
                 }
             }
@@ -562,7 +790,7 @@ impl Planner<'_> {
     }
 }
 
-fn delete_entry(entry: &Entry, roots: &Roots, tmp_days: u64) -> Result<()> {
+fn delete_entry(entry: &Entry, roots: &Roots) -> Result<()> {
     no_symlink_parents(&entry.path)?;
     if contains_mount(&entry.path, &mount_points()?) {
         bail!("路径包含挂载点");
@@ -571,16 +799,38 @@ fn delete_entry(entry: &Entry, roots: &Roots, tmp_days: u64) -> Result<()> {
     if Identity::from(&meta) != entry.identity {
         bail!("路径在扫描后发生变化，请重新扫描");
     }
-    if entry.temporary
-        && !temporary_tree_is_old(
-            &entry.path,
-            roots.uid,
-            tmp_days,
-            SystemTime::now(),
-            meta.dev(),
-        )?
-    {
-        bail!("临时目录已有近期内容或活跃端点");
+    if !matches!(entry.policy, Policy::Regular) {
+        let activity = Activity::scan(&roots.proc, roots.uid)?;
+        let activity_root = match &entry.policy {
+            Policy::Temporary { root, .. } | Policy::Version { root, .. } => root,
+            _ => &entry.path,
+        };
+        if activity.uses(activity_root) {
+            bail!("路径仍被进程使用");
+        }
+    }
+    match &entry.policy {
+        Policy::Temporary { days, .. } => {
+            if !temporary_tree_is_old(&entry.path, roots.uid, *days, SystemTime::now(), meta.dev())?
+            {
+                bail!("临时目录已有近期内容或活跃端点");
+            }
+        }
+        Policy::Version {
+            current,
+            versions,
+            root,
+        } => {
+            let current = fs::canonicalize(current).context("无法重新确认当前工具版本")?;
+            let versions = fs::canonicalize(versions)?;
+            if current == versions || !current.starts_with(&versions) {
+                bail!("当前工具版本不在版本目录内，保留所有版本");
+            }
+            if current.starts_with(fs::canonicalize(root)?) {
+                bail!("该版本已成为当前版本，保留");
+            }
+        }
+        _ => (),
     }
     if meta.is_dir() {
         fs::remove_dir_all(&entry.path)?;
@@ -617,10 +867,19 @@ mod tests {
             home: temp.path().join("home with spaces"),
             tmp: temp.path().join("tmp"),
             logs: temp.path().join("logs"),
+            shm: temp.path().join("shm"),
+            proc: temp.path().join("proc"),
+            cargo_home: temp.path().join("home with spaces/.cargo"),
             uid: fs::metadata(temp.path()).unwrap().uid(),
             mounts: vec![],
         };
-        for path in [&roots.home, &roots.tmp, &roots.logs] {
+        for path in [
+            &roots.home,
+            &roots.tmp,
+            &roots.logs,
+            &roots.shm,
+            &roots.proc,
+        ] {
             fs::create_dir_all(path).unwrap();
         }
         (temp, roots)
@@ -820,5 +1079,236 @@ mod tests {
                 .iter()
                 .all(|e| e.path != roots.logs.join("active.log"))
         );
+    }
+
+    fn process(roots: &Roots) -> PathBuf {
+        let process = roots.proc.join("123");
+        fs::create_dir_all(process.join("fd")).unwrap();
+        fs::write(process.join("maps"), "").unwrap();
+        process
+    }
+
+    #[test]
+    fn shared_memory_keeps_recent_active_protected_and_mounted_data() {
+        let (_temp, mut roots) = fixture();
+        let process = process(&roots);
+        for name in [
+            "unused/file",
+            "open/file",
+            "cwd/file",
+            "mapped/file",
+            "recent/file",
+            "locked/data.lock",
+            "mounted/file",
+            "sem.app",
+            "libpod_lock",
+            "keep/file",
+        ] {
+            file(&roots.shm.join(name));
+            if name != "recent/file" {
+                age(&roots.shm.join(name));
+            }
+        }
+        fs::create_dir_all(roots.shm.join("endpoint")).unwrap();
+        let _socket = UnixListener::bind(roots.shm.join("endpoint/socket")).unwrap();
+        for path in children(&roots.shm).unwrap() {
+            age(&path);
+        }
+        symlink(roots.shm.join("open/file"), process.join("fd/3")).unwrap();
+        symlink(roots.shm.join("cwd"), process.join("cwd")).unwrap();
+        fs::write(
+            process.join("maps"),
+            format!(
+                "123-456 r--p 0 00:00 42 {}\n",
+                roots.shm.join("mapped/file").display()
+            ),
+        )
+        .unwrap();
+        roots.mounts.push(roots.shm.join("mounted"));
+        file(&roots.home.join(".bashrc"));
+        let options = opts(&[
+            "--memory",
+            "--keep",
+            roots.shm.join("keep").to_str().unwrap(),
+        ]);
+        let plan = Plan::build(&roots, &options).unwrap();
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.entries[0].path, roots.shm.join("unused"));
+        assert_eq!(plan.execute(&roots, &options), 0);
+        assert!(!roots.shm.join("unused").exists());
+        assert!(roots.home.join(".bashrc").exists());
+        assert!(roots.shm.join("open/file").exists());
+        assert!(roots.shm.join("recent/file").exists());
+        assert!(roots.shm.join("sem.app").exists());
+        assert!(roots.shm.join("libpod_lock").exists());
+    }
+
+    #[test]
+    fn shared_memory_rechecks_process_activity_after_preview() {
+        let (_temp, roots) = fixture();
+        file(&roots.shm.join("work/file"));
+        age(&roots.shm.join("work/file"));
+        age(&roots.shm.join("work"));
+        let options = opts(&["--memory"]);
+        let plan = Plan::build(&roots, &options).unwrap();
+        assert_eq!(plan.entries.len(), 1);
+        let process = process(&roots);
+        symlink(roots.shm.join("work/file"), process.join("fd/3")).unwrap();
+        assert_eq!(plan.execute(&roots, &options), 1);
+        assert!(roots.shm.join("work/file").exists());
+    }
+
+    #[test]
+    fn shared_memory_cleans_around_locks_and_rechecks_activity_in_the_parent() {
+        let (_temp, roots) = fixture();
+        for name in [
+            "build/output/data",
+            "build/session.lock",
+            "build/.cargo-lock",
+        ] {
+            file(&roots.shm.join(name));
+            age(&roots.shm.join(name));
+        }
+        age(&roots.shm.join("build/output"));
+        age(&roots.shm.join("build"));
+        let options = opts(&["--memory"]);
+        let plan = Plan::build(&roots, &options).unwrap();
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.execute(&roots, &options), 0);
+        assert!(!roots.shm.join("build/output").exists());
+        assert!(roots.shm.join("build/session.lock").exists());
+        assert!(roots.shm.join("build/.cargo-lock").exists());
+        file(&roots.shm.join("build/output/data"));
+        for name in ["build/output/data", "build/output", "build"] {
+            age(&roots.shm.join(name));
+        }
+        let plan = Plan::build(&roots, &options).unwrap();
+        let process = process(&roots);
+        symlink(roots.shm.join("build"), process.join("cwd")).unwrap();
+        assert_eq!(plan.execute(&roots, &options), 1);
+        assert!(roots.shm.join("build/output/data").exists());
+    }
+
+    #[test]
+    fn current_and_running_codex_and_claude_versions_are_preserved() {
+        let (_temp, roots) = fixture();
+        let process = process(&roots);
+        for package in ["standalone", "app-server-daemon"] {
+            let root = roots.home.join(".codex/packages").join(package);
+            for name in ["old", "running", "current-version"] {
+                file(&root.join("releases").join(name).join("bin/tool"));
+            }
+            symlink("releases/current-version", root.join("current")).unwrap();
+            let fd = if package == "standalone" { "3" } else { "4" };
+            symlink(
+                root.join("releases/running/bin/tool"),
+                process.join("fd").join(fd),
+            )
+            .unwrap();
+        }
+        let versions = roots.home.join(".local/share/claude/versions");
+        for version in ["1.0", "2.0"] {
+            file(&versions.join(version));
+        }
+        fs::create_dir_all(roots.home.join(".local/bin")).unwrap();
+        symlink(versions.join("2.0"), roots.home.join(".local/bin/claude")).unwrap();
+        let options = opts(&["--old-versions"]);
+        let plan = Plan::build(&roots, &options).unwrap();
+        assert_eq!(plan.entries.len(), 3);
+        assert_eq!(plan.execute(&roots, &options), 0);
+        for package in ["standalone", "app-server-daemon"] {
+            let root = roots.home.join(".codex/packages").join(package);
+            assert!(!root.join("releases/old").exists());
+            assert!(root.join("releases/running/bin/tool").exists());
+            assert!(root.join("releases/current-version/bin/tool").exists());
+        }
+        assert!(!versions.join("1.0").exists());
+        assert!(versions.join("2.0").exists());
+    }
+
+    #[test]
+    fn versions_are_preserved_when_current_is_unknown_or_changes_after_scan() {
+        let (_temp, roots) = fixture();
+        let root = roots.home.join(".codex/packages/app-server-daemon");
+        file(&root.join("releases/old/bin/tool"));
+        file(&root.join("releases/old/keep"));
+        file(&root.join("releases/new/bin/tool"));
+        let options = opts(&[
+            "--old-versions",
+            "--keep",
+            root.join("releases/old/keep").to_str().unwrap(),
+        ]);
+        assert!(Plan::build(&roots, &options).unwrap().entries.is_empty());
+        symlink("releases/new", root.join("current")).unwrap();
+        let plan = Plan::build(&roots, &options).unwrap();
+        fs::remove_file(root.join("current")).unwrap();
+        symlink("releases/old", root.join("current")).unwrap();
+        assert_eq!(plan.execute(&roots, &options), 1);
+        assert!(root.join("releases/old/bin/tool").exists());
+    }
+
+    #[test]
+    fn cargo_preview_is_read_only_and_cleanup_preserves_tools_configuration_and_locks() {
+        let (_temp, mut roots) = fixture();
+        roots.cargo_home = roots.home.join("custom-cargo");
+        for path in [
+            "registry/src/package/source",
+            "git/checkouts/package/source",
+            "advisory-db/data",
+            "bin/tool",
+            "config.toml",
+            "credentials.toml",
+            ".crates.toml",
+        ] {
+            file(&roots.cargo_home.join(path));
+        }
+        let options = opts(&["--cargo-cache"]);
+        let plan = Plan::build(&roots, &options).unwrap();
+        assert_eq!(plan.entries.len(), 3);
+        assert_eq!(plan.execute(&roots, &opts(&["--cargo-cache", "-n"])), 0);
+        assert!(!roots.cargo_home.join(".package-cache").exists());
+        assert_eq!(plan.execute(&roots, &options), 0);
+        for path in ["registry", "git", "advisory-db"] {
+            assert!(!roots.cargo_home.join(path).exists());
+        }
+        for path in [
+            "bin/tool",
+            "config.toml",
+            "credentials.toml",
+            ".crates.toml",
+            ".package-cache",
+            ".package-cache-mutate",
+        ] {
+            assert!(roots.cargo_home.join(path).exists());
+        }
+    }
+
+    #[test]
+    fn cargo_in_use_during_scan_or_execution_is_not_removed() {
+        let (_temp, roots) = fixture();
+        file(&roots.cargo_home.join("registry/src/package/source"));
+        let options = opts(&["--cargo-cache"]);
+        let locks = CargoLocks::acquire(&roots.cargo_home).unwrap();
+        assert!(Plan::build(&roots, &options).unwrap().entries.is_empty());
+        drop(locks);
+        let plan = Plan::build(&roots, &options).unwrap();
+        let _locks = CargoLocks::acquire(&roots.cargo_home).unwrap();
+        assert_eq!(plan.execute(&roots, &options), 1);
+        assert!(
+            roots
+                .cargo_home
+                .join("registry/src/package/source")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn maintenance_is_preserved_if_process_inspection_is_unavailable() {
+        let (_temp, mut roots) = fixture();
+        file(&roots.cargo_home.join("registry/data"));
+        roots.proc = roots.proc.join("missing");
+        let plan = Plan::build(&roots, &opts(&["--cargo-cache"])).unwrap();
+        assert!(plan.entries.is_empty());
+        assert!(!plan.notices.is_empty());
     }
 }
