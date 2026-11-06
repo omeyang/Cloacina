@@ -13,7 +13,7 @@ pub enum EngineChoice {
 #[command(
     version,
     about = "Linux 清理工具：cloacina -a 全部清理，cloacina -an 预览全部",
-    after_help = "容器、镜像和未被引用的卷分别选择：全部删除 / 逐个确认 / 跳过。\n卷包含命名卷和匿名卷；确认删除会永久移除数据，仍被容器引用的卷保留。\n默认保留 ~/.cache/gitstatus、Zsh 历史、Claude memory 和容器网络。\n文件清理会删除旧 shell 配置和 .venvs；首次在其他机器运行请先用 -n 查看。"
+    after_help = "容器、镜像和未被引用的卷分别选择：全部删除 / 逐个确认 / 跳过。\n卷包含命名卷和匿名卷；确认删除会永久移除数据，仍被容器引用的卷保留。\n默认保留 ~/.costrict（含全部子目录与文件）、~/.cache/gitstatus、Zsh 历史、Claude memory 和容器网络。\n文件清理会删除旧 shell 配置和 .venvs；首次在其他机器运行请先用 -n 查看。"
 )]
 pub struct Options {
     /// 全部清理：默认项目 + 深度清理 + 系统日志；容器、镜像和卷仍交互确认

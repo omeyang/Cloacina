@@ -23,7 +23,7 @@ cloacina --memory --old-versions --cargo-cache -n  # 只预览这三类，可去
 cloacina --help
 ```
 
-文件清理按清单直接执行，包含 Bash 配置和 `.venvs`；可用 `--keep PATH` 保留所需文件或目录。`~/.cache/gitstatus` 始终保留。`-a` 已包含 `--deep --system`，无需再拼接 `--containers-only`，后者表示“仅容器、镜像和卷”。
+文件清理按清单直接执行，包含 Bash 配置和 `.venvs`；可用 `--keep PATH` 保留所需文件或目录。`~/.costrict` 及其全部子目录与文件、`~/.cache/gitstatus` 始终保留，无需额外传入 `--keep`；root 用户对应 `/root/.costrict`。`-a` 已包含 `--deep --system`，无需再拼接 `--containers-only`，后者表示“仅容器、镜像和卷”。
 
 卷在容器、镜像处理后重新扫描，包含未被任何容器引用的**命名卷和匿名卷**。卷单独确认，默认跳过；删除会永久移除卷内数据。仍被运行中或已停止容器引用的卷保留，删除时不使用强制参数。`-n` 仅展示当前未被引用的卷，实际删除容器后可能出现更多候选。无交互终端时跳过容器、镜像和卷。仅处理当前用户的本机引擎存储，容器网络保留。
 

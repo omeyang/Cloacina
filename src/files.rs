@@ -16,7 +16,6 @@ const HOME_FILES: &[&str] = &[
     ".my-git-sync-cron.sh",
     ".shell.pre-oh-my-zsh",
     ".roo",
-    ".costrict",
     ".dotnet",
     "gobuild-verify.log",
     ".venvs",
@@ -171,6 +170,7 @@ struct Planner<'a> {
 impl Plan {
     pub fn build(roots: &Roots, options: &Options) -> Result<Self> {
         let mut keep = vec![
+            roots.home.join(".costrict"),
             roots.home.join(".cache/gitstatus"),
             roots.home.join(".zsh_history"),
         ];
@@ -937,6 +937,85 @@ mod tests {
         assert_eq!(plan.execute(&roots, &options), 0);
         assert!(removed.iter().all(|p| !roots.home.join(p).exists()));
         assert!(kept.iter().all(|p| roots.home.join(p).exists()));
+    }
+
+    #[test]
+    fn costrict_tree_is_preserved_in_every_cleanup_scope() {
+        for args in [
+            vec![],
+            vec!["--deep"],
+            vec!["-a"],
+            vec!["--system"],
+            vec!["--memory"],
+            vec!["--old-versions"],
+            vec!["--cargo-cache"],
+        ] {
+            let (_temp, roots) = fixture();
+            let costrict = roots.home.join(".costrict");
+            let kept = [
+                "config.json",
+                "sessions/project/history.jsonl",
+                "cache/nested/data",
+                ".hidden/state",
+            ];
+            for name in kept {
+                file(&costrict.join(name));
+                age(&costrict.join(name));
+            }
+            fs::create_dir_all(costrict.join("empty/nested")).unwrap();
+            symlink("config.json", costrict.join("config-link")).unwrap();
+            file(&roots.home.join(".cache/disposable/data"));
+
+            let options = opts(&args);
+            let plan = Plan::build(&roots, &options).unwrap();
+            assert!(
+                plan.entries.iter().all(|entry| {
+                    !entry.path.starts_with(&costrict) && !costrict.starts_with(&entry.path)
+                }),
+                "CoStrict must not be a deletion candidate: {args:?}"
+            );
+            let mut preview_args = args.clone();
+            preview_args.push("-n");
+            assert_eq!(plan.execute(&roots, &opts(&preview_args)), 0);
+            assert!(roots.home.join(".cache/disposable/data").exists());
+            assert_eq!(plan.execute(&roots, &options), 0);
+            for name in kept {
+                assert_eq!(fs::read(costrict.join(name)).unwrap(), b"data");
+            }
+            assert!(costrict.join("empty/nested").is_dir());
+            assert_eq!(
+                fs::read_link(costrict.join("config-link")).unwrap(),
+                Path::new("config.json")
+            );
+            assert_eq!(
+                roots.home.join(".cache/disposable/data").exists(),
+                options.targeted()
+            );
+        }
+    }
+
+    #[test]
+    fn costrict_is_preserved_when_used_as_cargo_home() {
+        let (_temp, mut roots) = fixture();
+        roots.cargo_home = roots.home.join(".costrict");
+        for name in [
+            "registry/index/data",
+            "git/checkouts/data",
+            "advisory-db/data",
+        ] {
+            file(&roots.cargo_home.join(name));
+        }
+        let options = opts(&["--cargo-cache"]);
+        let plan = Plan::build(&roots, &options).unwrap();
+        assert!(plan.entries.is_empty());
+        assert_eq!(plan.execute(&roots, &options), 0);
+        for name in [
+            "registry/index/data",
+            "git/checkouts/data",
+            "advisory-db/data",
+        ] {
+            assert_eq!(fs::read(roots.cargo_home.join(name)).unwrap(), b"data");
+        }
     }
 
     #[test]
