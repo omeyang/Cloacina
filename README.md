@@ -27,6 +27,48 @@ cloacina --help
 
 卷在容器、镜像处理后重新扫描，包含未被任何容器引用的**命名卷和匿名卷**。卷单独确认，默认跳过；删除会永久移除卷内数据。仍被运行中或已停止容器引用的卷保留，删除时不使用强制参数。`-n` 仅展示当前未被引用的卷，实际删除容器后可能出现更多候选。无交互终端时跳过容器、镜像和卷。仅处理当前用户的本机引擎存储，容器网络保留。
 
+## 本机资源白名单
+
+常驻服务、基础镜像和数据卷可以通过本机配置保护。配置路径按以下顺序选择，使用优先级最高的一份，不合并：
+
+1. `--whitelist PATH`
+2. 环境变量 `CLOACINA_WHITELIST`
+3. `~/.config/cloacina/whitelist.conf`（root 用户为 `/root/.config/cloacina/whitelist.conf`）
+
+文件不存在时使用空白名单，清理行为与未配置时一致。创建配置示例：
+
+```sh
+mkdir -p ~/.config/cloacina
+cat > ~/.config/cloacina/whitelist.conf <<'EOF'
+# 空行及以 # 开头的整行注释会被忽略
+container rapidocr-web
+container-label PODMAN_SYSTEMD_UNIT=rapidocr-web.service
+image localhost/rapidocr-web:latest
+volume rapidocr-data
+EOF
+
+cloacina -an                           # 预览白名单保留项和清理候选
+cloacina -a                            # 全部删除模式也会排除白名单资源
+cloacina -an --whitelist /path/keep.conf
+CLOACINA_WHITELIST=/path/keep.conf cloacina -an
+cloacina -an --no-whitelist             # 本次忽略白名单；去掉 -n 后执行
+```
+
+每行是一个资源类型和一个值，以空格或 Tab 分隔；值内不支持空白、引号、行尾注释或 glob。规则之间是“或”的关系：
+
+| 规则 | 匹配与保护范围 |
+| --- | --- |
+| `container <name>` | 容器名精确匹配，包括运行中和已停止的容器 |
+| `container-label <key=value>` | label 的键和值精确匹配；例如上面的规则保护对应 Quadlet 单元的容器。多个单元可各写一行，不支持用 `*` 匹配所有 systemd 单元 |
+| `image <repo:tag\|id>` | 精确匹配引擎列出的镜像标签，或匹配镜像 ID；支持带或不带 `sha256:` 的完整 ID，以及至少 12 位十六进制前缀。前缀匹配多个 ID 时全部保留；任一标签命中会保留同一 ID 的全部标签 |
+| `volume <name>` | 卷名精确匹配，包括暂未被容器引用的卷 |
+
+白名单容器不会进入删除候选，其镜像和命名卷、匿名卷也会自动保留。显式保护镜像或卷不会反向保护引用它的容器；需要保留常驻服务时应配置容器名或 label。Podman 与 Docker 分别在当前用户的本机存储中应用同一份规则。
+
+预览和交互运行都会输出“白名单保留 N 项”及资源明细，统计包含容器依赖且去重。没有匹配资源的规则只提示，不报错；配置无法读取或格式错误会在清理开始前报错退出。无法检查保护依赖时跳过该引擎的全部容器、镜像和卷清理，并返回失败状态。`--no-whitelist` 忽略环境变量和默认配置，与 `--whitelist` 互斥。`--keep PATH` 继续用于文件系统路径保护。
+
+## 按类别清理
+
 `-a` 和 `--deep` 还包含以下项目；也可以用表中的独立参数只清理指定类别，三个参数可组合，支持 `-n` 和 `--keep PATH`，不同时执行常规文件、容器或系统包清理。
 
 | 参数 | 清理范围与保留规则 |

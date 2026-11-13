@@ -1,6 +1,7 @@
 use crate::cli::EngineChoice;
 use crate::command::{Invocation, Runner, checked, which};
 use crate::prompt::{Answer, Mode, Prompts};
+use crate::whitelist::{Protection, Whitelist};
 use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -265,6 +266,37 @@ impl Engine {
         )?)
     }
 
+    fn protection(&self, runner: &dyn Runner, whitelist: &Whitelist) -> Result<Protection> {
+        if whitelist.is_empty() {
+            return Ok(Protection::default());
+        }
+        println!("\n▸ 本机 {} 白名单检查", self.name());
+        let containers = self.items(runner, false)?;
+        let images = self.items(runner, true)?;
+        // Include referenced volumes when checking whether a rule exists on this machine.
+        let volumes = volume_inventory(&checked(
+            runner,
+            &self.command(&["volume", "ls", "--format", "{{.Name}}|{{.Driver}}"]),
+        )?)?;
+        let mut inspections = Vec::new();
+        for container in containers.iter().filter(|c| whitelist.needs_inspect(c)) {
+            let text = checked(
+                runner,
+                &self.command(&["container", "inspect", &container.id]),
+            )?;
+            let mut values: Vec<serde_json::Value> =
+                serde_json::from_str(&text).context("容器 inspect 返回了无效 JSON")?;
+            if values.len() != 1
+                || values[0].get("Id").and_then(serde_json::Value::as_str)
+                    != Some(container.id.as_str())
+            {
+                bail!("容器 inspect 结果与清单不一致：{}", container.id);
+            }
+            inspections.push((container.id.clone(), values.remove(0)));
+        }
+        whitelist.resolve(&containers, &inspections, &images, &volumes)
+    }
+
     fn remove_image(&self, runner: &dyn Runner, image: &Item) -> Result<()> {
         if self.in_use(runner, image)? {
             bail!("镜像仍被容器引用，保留镜像及标签");
@@ -277,16 +309,32 @@ impl Engine {
         Ok(())
     }
 
-    pub fn cleanup(&self, runner: &dyn Runner, prompts: &mut dyn Prompts, dry_run: bool) -> usize {
+    pub fn cleanup(
+        &self,
+        runner: &dyn Runner,
+        prompts: &mut dyn Prompts,
+        dry_run: bool,
+        whitelist: &Whitelist,
+    ) -> usize {
+        let protection = match self.protection(runner, whitelist) {
+            Ok(protection) => protection,
+            Err(error) => {
+                eprintln!(
+                    "  {} 白名单检查失败，跳过该引擎清理：{error:#}",
+                    self.name()
+                );
+                return 1;
+            }
+        };
         let mut errors = 0;
         for images in [false, true] {
-            if let Err(error) = self.group(runner, prompts, dry_run, images) {
+            if let Err(error) = self.group(runner, prompts, dry_run, images, &protection) {
                 eprintln!("  {}：{error:#}", self.name());
                 errors += 1;
             }
         }
         // Scan after container removal so newly orphaned volumes are included.
-        if let Err(error) = self.volume_group(runner, prompts, dry_run) {
+        if let Err(error) = self.volume_group(runner, prompts, dry_run, &protection) {
             eprintln!("  {}：{error:#}", self.name());
             errors += 1;
         }
@@ -298,14 +346,19 @@ impl Engine {
         runner: &dyn Runner,
         prompts: &mut dyn Prompts,
         dry_run: bool,
+        protection: &Protection,
     ) -> Result<()> {
         println!("\n▸ 本机 {} 未被容器引用的卷", self.name());
-        let items = self.volumes(runner)?;
+        let items: Vec<_> = self
+            .volumes(runner)?
+            .into_iter()
+            .filter(|item| !protection.volumes.contains(&item.id))
+            .collect();
         if dry_run {
             println!("  仅列出当前未被引用的卷；实际删除容器后会重新扫描，可能出现更多候选。");
         }
         if items.is_empty() {
-            println!("  没有未被容器引用的卷。");
+            println!("  没有可清理的未被容器引用的卷。");
             return Ok(());
         }
         for item in &items {
@@ -349,12 +402,23 @@ impl Engine {
         prompts: &mut dyn Prompts,
         dry_run: bool,
         images: bool,
+        protection: &Protection,
     ) -> Result<()> {
         let label = if images { "镜像" } else { "容器" };
         println!("\n▸ 本机 {} {label}", self.name());
-        let items = self.items(runner, images)?;
+        let items: Vec<_> = self
+            .items(runner, images)?
+            .into_iter()
+            .filter(|item| {
+                if images {
+                    !protection.keeps_image(item)
+                } else {
+                    !protection.containers.contains(&item.id)
+                }
+            })
+            .collect();
         if items.is_empty() {
-            println!("  没有{label}。");
+            println!("  没有可清理的{label}。");
             return Ok(());
         }
         for item in &items {
@@ -375,7 +439,7 @@ impl Engine {
             return Ok(());
         }
         if images {
-            self.remove_images(runner, &selected)
+            self.remove_images(runner, &selected, protection)
         } else {
             let mut args = vec!["rm", "--force"];
             args.extend(selected.iter().map(|item| item.id.as_str()));
@@ -385,7 +449,12 @@ impl Engine {
         }
     }
 
-    fn remove_images(&self, runner: &dyn Runner, selected: &[Item]) -> Result<()> {
+    fn remove_images(
+        &self,
+        runner: &dyn Runner,
+        selected: &[Item],
+        protection: &Protection,
+    ) -> Result<()> {
         let mut pending: HashSet<_> = selected.iter().map(|item| item.id.clone()).collect();
         let mut failures = HashMap::new();
         // Intermediate images may precede their children. Retry only selected IDs if a pass
@@ -396,6 +465,10 @@ impl Engine {
             let existing: HashSet<_> = current.iter().map(|i| i.id.clone()).collect();
             pending.retain(|id| existing.contains(id));
             for image in current.iter().filter(|image| pending.contains(&image.id)) {
+                if protection.keeps_image(image) {
+                    failures.insert(image.id.clone(), "白名单保留".into());
+                    continue;
+                }
                 if let Err(error) = self.remove_image(runner, image) {
                     failures.insert(image.id.clone(), format!("{error:#}"));
                 }
@@ -612,6 +685,133 @@ mod tests {
         "{{.Name}}|{{.Driver}}",
     ];
 
+    const CONTAINER_LS: &[&str] = &[
+        "--remote=false",
+        "ps",
+        "--all",
+        "--no-trunc",
+        "--format",
+        "{{.ID}}|{{.Names}}|{{.Status}}|{{.Image}}",
+    ];
+    const IMAGE_LS: &[&str] = &[
+        "--remote=false",
+        "images",
+        "--all",
+        "--no-trunc",
+        "--format",
+        "{{.ID}}|{{.Repository}}:{{.Tag}}|{{.Size}}",
+    ];
+    const ALL_VOLUME_LS: &[&str] = &[
+        "--remote=false",
+        "volume",
+        "ls",
+        "--format",
+        "{{.Name}}|{{.Driver}}",
+    ];
+
+    #[test]
+    fn whitelist_all_only_removes_unprotected_resources() {
+        let containers = "aaa|web|running|web:latest\nbbb|temporary|running|scratch:latest";
+        let images = "sha256:111|web:latest|1 MB\n222|base:one|1 MB\n222|base:two|1 MB\n333|scratch:latest|1 MB";
+        let kept_images = "sha256:111|web:latest|1 MB\n222|base:one|1 MB\n222|base:two|1 MB";
+        let volumes = "data|local\nspare|local\ndrop|local";
+        let runner = FakeRunner::new(&[
+            (CONTAINER_LS, 0, containers),
+            (IMAGE_LS, 0, images),
+            (ALL_VOLUME_LS, 0, volumes),
+            (
+                &["--remote=false", "container", "inspect", "aaa"],
+                0,
+                r#"[{"Id":"aaa","Image":"sha256:111","Mounts":[{"Type":"volume","Name":"data"}]}]"#,
+            ),
+            (CONTAINER_LS, 0, containers),
+            (&["--remote=false", "rm", "--force", "bbb"], 0, ""),
+            (IMAGE_LS, 0, images),
+            (IMAGE_LS, 0, images),
+            (
+                &[
+                    "--remote=false",
+                    "ps",
+                    "--all",
+                    "--quiet",
+                    "--filter",
+                    "ancestor=333",
+                ],
+                0,
+                "",
+            ),
+            (
+                &["--remote=false", "rmi", "--no-prune", "scratch:latest"],
+                0,
+                "",
+            ),
+            (IMAGE_LS, 0, kept_images),
+            (VOLUME_LS, 0, "spare|local\ndrop|local"),
+            (&["--remote=false", "volume", "rm", "drop"], 0, ""),
+        ]);
+        let mut choices = Choices {
+            mode: Mode::All,
+            answers: VecDeque::new(),
+        };
+        let whitelist = Whitelist::parse("container web\nimage base:one\nvolume spare").unwrap();
+        assert_eq!(
+            podman().cleanup(&runner, &mut choices, false, &whitelist),
+            0
+        );
+        assert!(runner.results.borrow().is_empty());
+    }
+
+    struct NoPrompts;
+    impl Prompts for NoPrompts {
+        fn mode(&mut self, _: &str) -> Result<Mode> {
+            panic!("unexpected prompt")
+        }
+        fn item(&mut self, _: &str) -> Result<Answer> {
+            panic!("unexpected prompt")
+        }
+    }
+
+    #[test]
+    fn whitelist_preview_and_failed_inspection_never_prompt_or_delete() {
+        let containers = "aaa|web|running|web:latest";
+        let whitelist = Whitelist::parse("container-label unit=web.service").unwrap();
+        for (code, inspection) in [
+            (
+                0,
+                r#"[{"Id":"aaa","Image":"111","Config":{"Labels":{"unit":"web.service"}},"Mounts":[]}]"#,
+            ),
+            (125, "inspection failed"),
+            (0, "[]"),
+            (0, r#"[{"Id":"bbb"}]"#),
+            (0, "not json"),
+        ] {
+            let mut sequence = vec![
+                (CONTAINER_LS, 0, containers),
+                (IMAGE_LS, 0, "111|web:latest|1 MB"),
+                (ALL_VOLUME_LS, 0, ""),
+                (
+                    &["--remote=false", "container", "inspect", "aaa"][..],
+                    code,
+                    inspection,
+                ),
+            ];
+            let valid = code == 0 && inspection.contains("web.service");
+            if valid {
+                sequence.extend([
+                    (CONTAINER_LS, 0, containers),
+                    (IMAGE_LS, 0, "111|web:latest|1 MB"),
+                    (VOLUME_LS, 0, ""),
+                ]);
+            }
+            let runner = FakeRunner::new(&sequence);
+            assert_eq!(
+                podman().cleanup(&runner, &mut NoPrompts, valid, &whitelist),
+                usize::from(!valid)
+            );
+            assert!(runner.results.borrow().is_empty());
+        }
+    }
+
     #[test]
     fn volumes_accept_names_and_anonymous_ids_but_reject_invalid_inventory() {
         let anonymous = "a".repeat(64);
@@ -643,7 +843,7 @@ mod tests {
                 answers: VecDeque::new(),
             };
             podman()
-                .volume_group(&runner, &mut choices, dry_run)
+                .volume_group(&runner, &mut choices, dry_run, &Protection::default())
                 .unwrap();
             assert!(runner.results.borrow().is_empty());
             assert_eq!(runner.calls.borrow().len(), 1);
@@ -664,7 +864,9 @@ mod tests {
             mode: Mode::Each,
             answers: [Answer::No, Answer::Yes, Answer::Quit].into(),
         };
-        podman().volume_group(&runner, &mut choices, false).unwrap();
+        podman()
+            .volume_group(&runner, &mut choices, false, &Protection::default())
+            .unwrap();
         assert!(runner.results.borrow().is_empty());
         assert!(choices.answers.is_empty());
     }
@@ -684,7 +886,11 @@ mod tests {
             mode: Mode::All,
             answers: VecDeque::new(),
         };
-        assert!(podman().volume_group(&runner, &mut choices, false).is_err());
+        assert!(
+            podman()
+                .volume_group(&runner, &mut choices, false, &Protection::default())
+                .is_err()
+        );
         assert!(runner.results.borrow().is_empty());
     }
 
@@ -726,7 +932,9 @@ mod tests {
             mode: Mode::All,
             answers: VecDeque::new(),
         };
-        engine.volume_group(&runner, &mut choices, false).unwrap();
+        engine
+            .volume_group(&runner, &mut choices, false, &Protection::default())
+            .unwrap();
         assert!(runner.results.borrow().is_empty());
         assert!(
             runner
@@ -772,7 +980,10 @@ mod tests {
             mode: Mode::All,
             answers: VecDeque::new(),
         };
-        assert_eq!(podman().cleanup(&runner, &mut choices, false), 1);
+        assert_eq!(
+            podman().cleanup(&runner, &mut choices, false, &Whitelist::default()),
+            1
+        );
         assert!(runner.results.borrow().is_empty());
     }
 

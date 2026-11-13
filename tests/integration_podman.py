@@ -36,6 +36,7 @@ def main():
         test_home = root / 'home'
         test_home.mkdir()
         env = dict(os.environ, HOME=str(test_home))
+        env.pop('CLOACINA_WHITELIST', None)
         base = [podman_exe, '--remote=false', '--root', str(root / 'store'),
                 '--runroot', str(root / 'run'), '--storage-driver', 'vfs',
                 '--events-backend', 'file', '--tmpdir', str(root / 'tmp')]
@@ -47,7 +48,7 @@ def main():
                 raise RuntimeError(f'{args}: {result.stderr}\n{result.stdout}')
             return result.stdout.strip()
 
-        for kind in ('keep', 'drop'):
+        def make_image(kind):
             context = root / kind
             context.mkdir()
             (context / 'marker').write_text(kind)
@@ -55,6 +56,9 @@ def main():
                 'FROM scratch\nCOPY marker /marker\nCMD ["/not-run"]\n')
             podman('build', '--pull=never', '-q', '-t', f'localhost/cloacina-{kind}:one', str(context))
             podman('tag', f'localhost/cloacina-{kind}:one', f'localhost/cloacina-{kind}:two')
+
+        for kind in ('keep', 'drop'):
+            make_image(kind)
             podman('volume', 'create', f'cloacina-{kind}-data')
             podman('create', '--network=none', '--name', f'cloacina-{kind}',
                    '--volume', f'cloacina-{kind}-data:/named', '--volume', '/anonymous',
@@ -77,9 +81,9 @@ def main():
         env['PATH'] = str(isolated_bin) + os.pathsep + os.environ['PATH']
         command = [str(binary), '--containers-only', '--engine', 'podman']
 
-        def interact(mode, volume_mode=None):
+        def interact(mode, volume_mode=None, extra=()):
             master, slave = pty.openpty()
-            process = subprocess.Popen(command, env=env, stdin=slave,
+            process = subprocess.Popen([*command, *extra], env=env, stdin=slave,
                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             os.close(slave)
             output = ''
@@ -160,6 +164,75 @@ def main():
         assert code == 0, (code, output)
         assert podman('volume', 'ls', '--quiet') == ''
         print('PASS: all selected unused volumes deleted', flush=True)
+
+        # Exercise machine-local protection against actual engine inventories and removals.
+        for kind in ('protected', 'managed', 'disposable', 'base'):
+            make_image(kind)
+            if kind == 'base':
+                continue
+            podman('volume', 'create', f'cloacina-{kind}-data')
+            podman('create', '--network=none', '--name', f'cloacina-{kind}',
+                   '--label', f'PODMAN_SYSTEMD_UNIT={kind}.service',
+                   '--volume', f'cloacina-{kind}-data:/named', '--volume', '/anonymous',
+                   f'localhost/cloacina-{kind}:one')
+        podman('volume', 'create', 'cloacina-whitelisted-empty')
+        podman('volume', 'create', 'cloacina-free')
+        whitelist = test_home / '.config/cloacina/whitelist.conf'
+        whitelist.parent.mkdir(parents=True)
+        whitelist.write_text(
+            '# Machine-local persistent services\n\n'
+            'container cloacina-protected\n'
+            'container-label PODMAN_SYSTEMD_UNIT=managed.service\n'
+            'image localhost/cloacina-base:two\n'
+            'volume cloacina-whitelisted-empty\n'
+            'container absent-on-this-machine\n'
+            'image localhost/absent:latest\n'
+            'volume absent-volume\n')
+        protected_volumes = {'cloacina-whitelisted-empty'}
+        protected_tags = set()
+        for kind in ('protected', 'managed'):
+            protected_volumes.update(mount['Name'] for mount in json.loads(podman(
+                'inspect', '--format', '{{json .Mounts}}', f'cloacina-{kind}'))
+                if mount['Type'] == 'volume')
+        for kind in ('protected', 'managed', 'base'):
+            protected_tags.update(json.loads(podman('image', 'inspect', '--format',
+                '{{json .RepoTags}}', f'localhost/cloacina-{kind}:one')))
+        initial_containers = podman('ps', '--all', '--quiet', '--no-trunc')
+        initial_volumes = set(podman('volume', 'ls', '--quiet').splitlines())
+        result = subprocess.run([*command, '-n'], env=env, capture_output=True,
+                                text=True, timeout=30)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert '白名单保留 10 项（容器 2、镜像 3、卷 5）' in result.stdout, result.stdout
+        assert '白名单未匹配本机资源：container absent-on-this-machine' in result.stdout
+        assert '白名单未匹配本机资源：image localhost/absent:latest' in result.stdout
+        assert '白名单未匹配本机资源：volume absent-volume' in result.stdout
+        candidates = result.stdout.split('▸ 本机 Podman 容器', 1)[1]
+        for kind in ('protected', 'managed', 'base'):
+            assert f'cloacina-{kind}' not in candidates, candidates
+        assert 'cloacina-whitelisted-empty' not in candidates, candidates
+        assert 'cloacina-disposable' in candidates and 'cloacina-free' in candidates
+        assert podman('ps', '--all', '--quiet', '--no-trunc') == initial_containers
+        assert set(podman('volume', 'ls', '--quiet').splitlines()) == initial_volumes
+        print('PASS: whitelist preview reports protected dependencies and missing rules; '
+              'protected resources excluded from candidates', flush=True)
+
+        code, output = interact('all')
+        assert code == 0, (code, output)
+        assert '白名单保留 10 项' in output, output
+        assert set(podman('ps', '--all', '--format', '{{.Names}}').splitlines()) == {
+            'cloacina-protected', 'cloacina-managed'}
+        assert set(podman('images', '--format', '{{.Repository}}:{{.Tag}}').splitlines()) == protected_tags
+        assert set(podman('volume', 'ls', '--quiet').splitlines()) == protected_volumes
+        print('PASS: all mode preserves named/labelled containers, dependency images and '
+              'named/anonymous volumes, explicit multitag image and unused volume', flush=True)
+
+        code, output = interact('all', extra=('--no-whitelist',))
+        # Referenced volumes still follow the engine's dangling check after container removal.
+        assert code == 0, (code, output)
+        assert podman('ps', '--all', '--quiet') == ''
+        assert podman('images', '--all', '--quiet') == ''
+        assert podman('volume', 'ls', '--quiet') == ''
+        print('PASS: --no-whitelist temporarily bypasses machine protection', flush=True)
 
     assert host_snapshot() == before, 'Host resources changed during test'
     print('PASS: host containers/images/volumes unchanged')

@@ -61,6 +61,12 @@ pub struct Options {
     /// 额外保留路径；相对路径以家目录为基准，可重复指定
     #[arg(long, value_name = "PATH")]
     pub keep: Vec<PathBuf>,
+    /// 本机容器资源白名单（优先于 CLOACINA_WHITELIST 和默认配置）
+    #[arg(long, value_name = "PATH", conflicts_with = "no_whitelist")]
+    pub whitelist: Option<PathBuf>,
+    /// 本次忽略容器资源白名单
+    #[arg(long)]
+    pub no_whitelist: bool,
 }
 
 impl Options {
@@ -87,6 +93,24 @@ mod tests {
             assert!(Options::try_parse_from(["cloacina", "--containers-only", flag]).is_err());
         }
         assert!(Options::try_parse_from(["cloacina", "-d", "-1"]).is_err());
+    }
+
+    #[test]
+    fn whitelist_flags_accept_a_path_or_disable_protection() {
+        let opts =
+            Options::try_parse_from(["cloacina", "-an", "--whitelist", "/tmp/keep.conf"]).unwrap();
+        assert_eq!(opts.whitelist, Some(PathBuf::from("/tmp/keep.conf")));
+        let opts = Options::try_parse_from(["cloacina", "--no-whitelist"]).unwrap();
+        assert!(opts.no_whitelist);
+        assert!(
+            Options::try_parse_from([
+                "cloacina",
+                "--whitelist",
+                "/tmp/keep.conf",
+                "--no-whitelist"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

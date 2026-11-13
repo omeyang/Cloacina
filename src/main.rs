@@ -4,6 +4,7 @@ mod command;
 mod engine;
 mod files;
 mod prompt;
+mod whitelist;
 
 use anyhow::Result;
 use clap::Parser;
@@ -60,6 +61,8 @@ fn external_cleanup(options: &cli::Options, uid: u32, runner: &dyn Runner) -> us
 
 fn run(options: &cli::Options) -> Result<usize> {
     let roots = files::Roots::from_environment()?;
+    let whitelist =
+        whitelist::Whitelist::load(options, &roots.home, std::env::var_os("CLOACINA_WHITELIST"))?;
     let runner = SystemRunner;
     let mut errors = 0;
     if !options.skip_containers && !options.targeted() {
@@ -77,7 +80,12 @@ fn run(options: &cli::Options) -> Result<usize> {
                 errors += 1;
             }
             for engine in engines {
-                errors += engine.cleanup(&runner, &mut prompt::TerminalPrompts, options.dry_run);
+                errors += engine.cleanup(
+                    &runner,
+                    &mut prompt::TerminalPrompts,
+                    options.dry_run,
+                    &whitelist,
+                );
             }
         }
     }
